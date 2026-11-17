@@ -3,13 +3,14 @@ import uuid
 
 import numpy as np
 import pytest
-from osgeo import gdal
+from osgeo import gdal, ogr, osr
 
 from overflow import accumulation
 from overflow._flow_accumulation.core import (
     single_tile_flow_accumulation,
     single_tile_flow_accumulation_weighted,
 )
+from overflow._flow_accumulation.core.flow_accumulation import get_next_cell
 from overflow._flow_accumulation.tiled import (
     _flow_accumulation_tiled,
     _flow_accumulation_weighted_tiled,
@@ -17,6 +18,7 @@ from overflow._flow_accumulation.tiled import (
 from overflow._util.constants import (
     FLOW_ACCUMULATION_NODATA,
     FLOW_DIRECTION_NODATA,
+    FLOW_DIRECTION_UNDEFINED,
     FLOW_EXTERNAL,
 )
 
@@ -163,6 +165,49 @@ def read_output_dataset(path):
     fac = band.ReadAsArray()
     gdal.Unlink(path)
     return fac
+
+
+def write_upstream_sources_file(path, points):
+    """Write a GeoJSON point source file with integer values."""
+    driver = ogr.GetDriverByName("GeoJSON")
+    dataset = driver.CreateDataSource(path)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(4326)
+    layer = dataset.CreateLayer("upstream_sources", srs=srs, geom_type=ogr.wkbPoint)
+    field = ogr.FieldDefn("value", ogr.OFTInteger)
+    layer.CreateField(field)
+
+    for x, y, value in points:
+        feature = ogr.Feature(layer.GetLayerDefn())
+        geometry = ogr.Geometry(ogr.wkbPoint)
+        geometry.AddPoint(x, y)
+        feature.SetGeometry(geometry)
+        feature.SetField("value", int(value))
+        layer.CreateFeature(feature)
+        feature = None
+
+    dataset = None
+
+
+def expected_fac_with_upstream_sources(fdr, source_cells):
+    """Expected FAC when source values are injected at raster cell locations."""
+    base_fac, _ = single_tile_flow_accumulation(fdr)
+    expected = base_fac.copy()
+    for (row, col), value in source_cells.items():
+        queue = [(row, col)]
+        visited = set()
+        while queue:
+            current_row, current_col = queue.pop()
+            if (current_row, current_col) in visited:
+                continue
+            visited.add((current_row, current_col))
+            expected[current_row, current_col] += value
+            next_row, next_col, next_value = get_next_cell(fdr, current_row, current_col)
+            if next_value in (FLOW_DIRECTION_NODATA, FLOW_DIRECTION_UNDEFINED):
+                continue
+            if 0 <= next_row < fdr.shape[0] and 0 <= next_col < fdr.shape[1]:
+                queue.append((next_row, next_col))
+    return expected
 
 
 # Tests
@@ -511,3 +556,261 @@ def test_accumulation_invalid_weights_nodata_mode_raises(
             weights_path=weights_path,
             weights_nodata_mode="bogus",
         )
+
+
+def test_accumulation_upstream_source_single_point():
+    """A single point source adds to the mapped boundary cell and propagates downstream."""
+    fdr = np.zeros((1, 5), dtype=np.ubyte)
+    fdr[0, :] = 0
+    fdr[0, -1] = 7
+
+    fdr_path = "/vsimem/test_upstream_single_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 1, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_single.geojson"
+    write_upstream_sources_file(src_path, [(1.3, 0.5, 5)])
+
+    try:
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=src_path)
+            fac = read_output_dataset(output_path)
+        expected = np.array([[1, 8, 15, 8, 9]], dtype=np.int64)
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_multiple_points_different_cells():
+    """Distinct boundary cells accumulate independently and both propagate downstream."""
+    fdr = np.zeros((1, 5), dtype=np.ubyte)
+    fdr[0, :] = 0
+    fdr[0, -1] = 7
+
+    fdr_path = "/vsimem/test_upstream_multi_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 1, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_multi.geojson"
+    write_upstream_sources_file(src_path, [(1.3, 0.5, 2), (4.1, 0.5, 3)])
+
+    try:
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=src_path)
+            fac = read_output_dataset(output_path)
+        expected = np.array([[1, 5, 9, 5, 10]], dtype=np.int64)
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_duplicate_points_warn_and_sum():
+    """Duplicate sources that snap to the same boundary cell are summed and warned."""
+    fdr = np.zeros((1, 5), dtype=np.ubyte)
+    fdr[0, :] = 0
+    fdr[0, -1] = 7
+
+    fdr_path = "/vsimem/test_upstream_dup_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 1, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_dup.geojson"
+    write_upstream_sources_file(src_path, [(1.2, 0.5, 2), (1.8, 0.5, 3)])
+
+    try:
+        with pytest.warns(UserWarning, match="Duplicate upstream source contribution|duplicate"):
+            with temporary_dataset() as output_path:
+                accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=src_path)
+                fac = read_output_dataset(output_path)
+        expected = np.array([[1, 8, 15, 8, 9]], dtype=np.int64)
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_partial_watershed_propagates_downstream():
+    """A boundary source acts as an upstream contribution entering the partial watershed."""
+    fdr = np.array(
+        [
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ],
+        dtype=np.ubyte,
+    )
+    fdr[0, 0] = 0
+    fdr[0, 1] = 0
+    fdr[1, 0] = 0
+    fdr[1, 1] = 0
+    fdr[2, :] = 0
+    fdr[2, -1] = 7
+
+    fdr_path = "/vsimem/test_upstream_partial_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 3, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_partial.geojson"
+    write_upstream_sources_file(src_path, [(0.5, 2.5, 7)])
+
+    try:
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=src_path)
+            fac = read_output_dataset(output_path)
+        expected = expected_fac_with_upstream_sources(fdr, {(0, 0): 7})
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_applies_at_point_location_even_if_edge_drains_outward():
+    """A source point is applied at its raster cell location; boundary snapping is not used."""
+    fdr = np.zeros((3, 5), dtype=np.ubyte)
+    fdr[1, 0] = 3
+    fdr[0, 0] = 0
+
+    fdr_path = "/vsimem/test_upstream_point_location_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 3, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_point_location.geojson"
+    write_upstream_sources_file(src_path, [(0.5, 0.5, 7)])
+
+    try:
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=src_path)
+            fac = read_output_dataset(output_path)
+        expected = expected_fac_with_upstream_sources(fdr, {(2, 0): 7})
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_warns_and_skips_point_outside_raster():
+    """A point outside the raster is ignored with a warning and no inflow is applied."""
+    fdr = np.zeros((3, 5), dtype=np.ubyte)
+    fdr[0, :] = 3
+    fdr[1, 0] = 4
+    fdr[2, :] = 7
+    fdr[:, -1] = 0
+
+    fdr_path = "/vsimem/test_upstream_invalid_outward_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 3, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_invalid_outward.geojson"
+    write_upstream_sources_file(src_path, [(-0.5, 1.5, 7)])
+
+    try:
+        with pytest.warns(UserWarning, match="outside the flow direction raster|outside the raster"):
+            with temporary_dataset() as output_path:
+                accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=src_path)
+                fac = read_output_dataset(output_path)
+        expected = expected_fac_with_upstream_sources(fdr, {})
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_propagates_across_tile_boundaries():
+    """An upstream source keeps its contribution when its path crosses into a neighboring tile."""
+    fdr = np.array(
+        [
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 7],
+        ],
+        dtype=np.ubyte,
+    )
+
+    fdr_path = "/vsimem/test_upstream_tile_boundary_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 3, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    src_path = "/vsimem/test_upstream_tile_boundary.geojson"
+    write_upstream_sources_file(src_path, [(0.5, 2.5, 7)])
+
+    try:
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=2, upstream_sources_path=src_path)
+            fac = read_output_dataset(output_path)
+        expected = expected_fac_with_upstream_sources(fdr, {(0, 0): 7})
+        np.testing.assert_array_equal(fac, expected)
+    finally:
+        gdal.Unlink(fdr_path)
+        gdal.Unlink(src_path)
+
+
+def test_accumulation_upstream_source_path_is_optional_and_default_is_unchanged():
+    """Omitting the upstream source file leaves the normal accumulation result unchanged."""
+    fdr = np.zeros((1, 5), dtype=np.ubyte)
+    fdr[0, :] = 0
+    fdr[0, -1] = 7
+
+    fdr_path = "/vsimem/test_upstream_default_fdr.tif"
+    driver = gdal.GetDriverByName("GTiff")
+    fdr_ds = driver.Create(fdr_path, fdr.shape[1], fdr.shape[0], 1, gdal.GDT_Byte)
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_band.WriteArray(fdr)
+    fdr_band.SetNoDataValue(FLOW_DIRECTION_NODATA)
+    fdr_ds.SetGeoTransform((0, 1, 0, 1, 0, -1))
+    fdr_ds.FlushCache()
+    fdr_ds = None
+
+    try:
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=0)
+            fac_default = read_output_dataset(output_path)
+        with temporary_dataset() as output_path:
+            accumulation(fdr_path, output_path, chunk_size=0, upstream_sources_path=None)
+            fac_explicit_none = read_output_dataset(output_path)
+        np.testing.assert_array_equal(fac_default, fac_explicit_none)
+    finally:
+        gdal.Unlink(fdr_path)

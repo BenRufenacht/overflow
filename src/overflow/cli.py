@@ -148,12 +148,19 @@ def breach_cli(
     help="If set, fills holes (nodata regions) in the DEM",
     is_flag=True,
 )
+@click.option(
+    "--max_fill_depth",
+    type=float,
+    default=None,
+    help="maximum fill depth in the DEM's vertical units above each sink's lowest elevation; if omitted, fill to the spill elevation",
+)
 def fill_cli(
     input_file: str,
     output_file: str | None,
     chunk_size: int,
     working_dir: str | None,
     fill_holes: bool,
+    max_fill_depth: float | None,
 ):
     """
     Fill depressions in a DEM using priority flood algorithm.
@@ -173,6 +180,7 @@ def fill_cli(
                     working_dir,
                     fill_holes,
                     progress_display.callback,
+                    max_fill_depth,
                 )
                 resource_stats.add_output_file("Filled DEM", output_file or input_file)
                 success = True
@@ -431,12 +439,32 @@ def burn_cli(
     type=click.Choice(["zero", "propagate"]),
     default="zero",
 )
+@click.option(
+    "--upstream_sources_file",
+    help=(
+        "optional point vector dataset whose integer attribute values are added to "
+        "the mapped boundary cell and propagated downstream along the flow network"
+    ),
+    required=False,
+    default=None,
+)
+@click.option(
+    "--upstream_sources_field",
+    help=(
+        "attribute field in --upstream_sources_file containing integer accumulation "
+        "values; defaults to a standard field name like 'value' or 'accumulation'"
+    ),
+    required=False,
+    default=None,
+)
 def accumulation_cli(
     input_file: str,
     output_file: str,
     chunk_size: int,
     weights_file: str | None,
     weights_nodata_mode: str,
+    upstream_sources_file: str | None,
+    upstream_sources_field: str | None,
 ):
     """
     Calculate flow accumulation from a flow direction raster.
@@ -458,6 +486,8 @@ def accumulation_cli(
                     weights_file,
                     weights_nodata_mode,
                     progress_display.callback,
+                    upstream_sources_path=upstream_sources_file,
+                    upstream_sources_field=upstream_sources_field,
                 )
                 resource_stats.add_output_file("Flow Accumulation", output_file)
                 success = True

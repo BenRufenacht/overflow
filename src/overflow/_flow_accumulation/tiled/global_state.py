@@ -235,12 +235,17 @@ def create_global_state_class(
             # Convert 2D global coordinates to 1D index
             return global_row * (self.num_cols * self.chunk_size) + global_col
 
-        def calculate_global_accumulation(self):
+        def calculate_global_accumulation(self, inject_index, inject_value):
             """
             Calculate the global accumulation by constructing and solving the global graph.
 
             This method orchestrates the process of building a global flow graph from tile data
             and then solving it to determine the final flow accumulation values.
+
+            Args:
+                inject_index (np.ndarray): int64 global indices receiving extra offset
+                    (e.g. entry cells of upstream sources in neighbouring tiles).
+                inject_value (np.ndarray): offset values matching inject_index.
 
             Returns:
                 tuple: Global accumulation, offset, and is-external dictionaries.
@@ -249,7 +254,11 @@ def create_global_state_class(
                 self.construct_global_graph()
             )
             global_acc, global_offset, global_acc_is_external = self.solve_global_graph(
-                graph_next, graph_accumulation, graph_is_external
+                graph_next,
+                graph_accumulation,
+                graph_is_external,
+                inject_index,
+                inject_value,
             )
             return global_acc, global_offset, global_acc_is_external
 
@@ -334,7 +343,14 @@ def create_global_state_class(
 
             return graph_next, graph_accumulation, graph_is_external
 
-        def solve_global_graph(self, graph_next, graph_accumulation, graph_is_external):
+        def solve_global_graph(
+            self,
+            graph_next,
+            graph_accumulation,
+            graph_is_external,
+            inject_index,
+            inject_value,
+        ):
             """
             Solve the global graph to calculate accumulation and offsets.
 
@@ -346,6 +362,8 @@ def create_global_state_class(
                 graph_next (dict): global index -> global index it drains to.
                 graph_accumulation (dict): global index -> its perimeter accumulation value.
                 graph_is_external (dict): global index -> whether it drains to an external tile.
+                inject_index (np.ndarray): int64 global indices receiving extra offset.
+                inject_value (np.ndarray): offset to add at each injected index.
 
             Returns:
                 tuple: Global accumulation, offset, and is-external dictionaries.
@@ -370,12 +388,20 @@ def create_global_state_class(
                     global_acc[index] = graph_accumulation[index]
                     global_acc_is_external[index] = True
 
+            # Seed injected upstream-source offsets. Adding them before the
+            # propagation below lets them flow through the global graph into
+            # downstream tiles, exactly like perimeter accumulation.
+            for k in range(inject_index.shape[0]):
+                injected_index = inject_index[k]
+                if injected_index in global_offset:
+                    global_offset[injected_index] += inject_value[k]
+
             # Initialize queue with source nodes (cells with no inflow)
             queue = offset_queue_class([(0, acc_zero)])
             queue.pop()  # Clear the initial dummy value
             for index in graph_next:
                 if inflow_count[index] == 0:
-                    queue.push((index, acc_zero))
+                    queue.push((index, global_offset[index]))
 
             # Propagate flow downstream using the queue
             while queue:

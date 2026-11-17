@@ -35,6 +35,9 @@ Directory for temporary files during tiled processing. Ignored for in-memory mod
 ### fill_holes
 Boolean flag controlling nodata region treatment. When False (default), nodata regions remain unchanged. When True, nodata cells assigned elevation of lowest surrounding valid cell, effectively filling nodata holes.
 
+### max_fill_depth
+Maximum fill depth in the DEM's vertical units, measured above the lowest elevation within each sink. When None (default), depressions fill to their spill points. When set, each sink fills to at most its lowest elevation plus this value. Must be greater than or equal to 0.
+
 ### progress_callback
 Optional callback for monitoring long operations. See [ProgressCallback API](../../api/index.md#overflow.ProgressCallback).
 
@@ -44,6 +47,15 @@ Optional callback for monitoring long operations. See [ProgressCallback API](../
 overflow fill \
     --input_file dem.tif \
     --output_file dem_filled.tif
+```
+
+To limit the fill depth, pass `--max_fill_depth` in the DEM's vertical units:
+
+```bash
+overflow fill \
+    --input_file dem.tif \
+    --output_file dem_filled.tif \
+    --max_fill_depth 5
 ```
 
 ## Python API Usage
@@ -62,9 +74,16 @@ overflow.fill(
     input_path="dem.tif",
     output_path=None
 )
+
+# Limit fill depth to 5 units above each sink's lowest elevation
+overflow.fill(
+    input_path="dem.tif",
+    output_path="dem_filled.tif",
+    max_fill_depth=5.0
+)
 ```
 
-All cells in the output DEM will have a flow path to the domain boundary with monotonically decreasing or constant elevation. Unmodified cells retain their original elevations and no cells are lowered.
+Without `max_fill_depth`, all cells in the output DEM will have a flow path to the domain boundary with monotonically decreasing or constant elevation. With `max_fill_depth`, depressions deeper than the limit remain partially unfilled, so some cells may still lack a flow path to the boundary. Unmodified cells retain their original elevations and no cells are lowered.
 
 ## Visualization
 

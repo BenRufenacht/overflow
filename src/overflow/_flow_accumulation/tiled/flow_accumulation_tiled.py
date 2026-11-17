@@ -74,6 +74,72 @@ def calculate_flow_accumulation_tile(
 
 
 @njit(nogil=True)
+def _walk_offset_downstream(
+    flow_acc: np.ndarray,
+    flow_dir: np.ndarray,
+    tile_row: int,
+    tile_col: int,
+    start_row: int,
+    start_col: int,
+    value,
+    global_state,
+    stop_map: dict,
+    stop_at_nodes: bool,
+):
+    """Add value to each cell downstream of (start_row, start_col) within the tile."""
+    rows, cols = flow_acc.shape
+    current_row, current_col = start_row, start_col
+    # sentinel must not collide with out-of-tile coordinates
+    prev_row, prev_col = -9999, -9999
+    current_dir = flow_dir[current_row, current_col]
+    # Cycle detection: no valid path should exceed total cells in tile
+    max_iterations = rows * cols
+    iterations = 0
+    while current_dir not in (FLOW_DIRECTION_NODATA, FLOW_DIRECTION_UNDEFINED):
+        iterations += 1
+        if iterations > max_iterations:
+            print(
+                "Warning: Cycle detected in flow direction data during finalization. tile:",
+                tile_row,
+                tile_col,
+                "cell:",
+                current_row,
+                current_col,
+            )
+            break
+        # Bounds check: ensure we're still within the tile
+        if not (0 <= current_row < rows and 0 <= current_col < cols):
+            break
+        flow_acc[current_row, current_col] += value
+        next_row, next_col, next_dir = get_next_cell(
+            flow_dir, current_row, current_col
+        )
+        if next_row == prev_row and next_col == prev_col:
+            # Two-cell cycle: stop before applying the value repeatedly
+            print(
+                "Warning: Cycle detected in flow direction data during finalization. tile:",
+                tile_row,
+                tile_col,
+                "cell:",
+                current_row,
+                current_col,
+            )
+            break
+        prev_row, prev_col = current_row, current_col
+        current_row, current_col, current_dir = next_row, next_col, next_dir
+        next_global_index = global_state.get_global_cell_index(
+            tile_row, tile_col, current_row, current_col
+        )
+        if (
+            stop_at_nodes
+            and next_global_index in stop_map
+            and stop_map[next_global_index]
+        ):
+            # Flow reaches a cell accounted for in global accumulation
+            break
+
+
+@njit(nogil=True)
 def finalize_flow_accumulation(
     flow_acc: np.ndarray,
     flow_dir: np.ndarray,
@@ -82,12 +148,16 @@ def finalize_flow_accumulation(
     tile_row: int,
     tile_col: int,
     global_state: GlobalState,
+    source_index: np.ndarray,
+    source_value: np.ndarray,
 ):
     """
     Finalize flow accumulation for a tile using global accumulation data.
 
-    This function adjusts the flow accumulation of a tile based on the global
-    accumulation data, propagating additional flow through the tile.
+    Graph-node offsets are walked downstream until the next cell with a computed
+    global accumulation, whose offset already contains the inflow. Upstream
+    sources are walked to the tile exit, since their values are not carried by
+    the graph.
 
     Args:
         flow_acc (np.ndarray): Initial flow accumulation for the tile.
@@ -97,6 +167,8 @@ def finalize_flow_accumulation(
         tile_row (int): Row index of the tile.
         tile_col (int): Column index of the tile.
         global_state (GlobalState): Global state object containing grid information.
+        source_index (np.ndarray): Global indices of upstream source cells.
+        source_value (np.ndarray): Upstream source values, aligned with source_index.
 
     Returns:
         tuple: Updated flow accumulation array and tile indices.
@@ -104,70 +176,80 @@ def finalize_flow_accumulation(
     rows, cols = flow_acc.shape
     chunk_size = global_state.chunk_size
 
-    # Process each entry in the global accumulation and offset
     for global_index in global_offset:
-        # Convert global index to local tile coordinates
         global_row = global_index // (global_state.num_cols * chunk_size)
         global_col = global_index % (global_state.num_cols * chunk_size)
         local_row = global_row - tile_row * chunk_size
         local_col = global_col - tile_col * chunk_size
-
-        # Check if the cell is within this tile
         if 0 <= local_row < rows and 0 <= local_col < cols:
-            # Propagate the additional accumulation downstream
-            current_row, current_col = local_row, local_col
-            # sentinel must not collide with out-of-tile coordinates
-            prev_row, prev_col = -9999, -9999
-            current_dir = flow_dir[current_row, current_col]
-            # Cycle detection: no valid path should exceed total cells in tile
-            max_iterations = rows * cols
-            iterations = 0
-            while current_dir not in (FLOW_DIRECTION_NODATA, FLOW_DIRECTION_UNDEFINED):
-                iterations += 1
-                if iterations > max_iterations:
-                    # Cycle detected - stop propagation
-                    print(
-                        "Warning: Cycle detected in flow direction data during finalization. tile:",
-                        tile_row,
-                        tile_col,
-                        "cell:",
-                        current_row,
-                        current_col,
-                    )
-                    break
-                # Bounds check: ensure we're still within the tile
-                if not (0 <= current_row < rows and 0 <= current_col < cols):
-                    break
-                flow_acc[current_row, current_col] += global_offset[global_index]
-                next_row, next_col, next_dir = get_next_cell(
-                    flow_dir, current_row, current_col
-                )
-                if next_row == prev_row and next_col == prev_col:
-                    # The current cell and the previous cell point at each
-                    # other: a two-cell cycle. Stop before applying the offset
-                    # to the pair again and again until max_iterations.
-                    print(
-                        "Warning: Cycle detected in flow direction data during finalization. tile:",
-                        tile_row,
-                        tile_col,
-                        "cell:",
-                        current_row,
-                        current_col,
-                    )
-                    break
-                prev_row, prev_col = current_row, current_col
-                current_row, current_col, current_dir = next_row, next_col, next_dir
-                next_global_index = global_state.get_global_cell_index(
-                    tile_row, tile_col, current_row, current_col
-                )
-                if (
-                    next_global_index in global_acc
-                    and global_acc[next_global_index] != 0
-                ):
-                    # Flow reaches a cell accounted for in global accumulation
-                    break
+            _walk_offset_downstream(
+                flow_acc,
+                flow_dir,
+                tile_row,
+                tile_col,
+                local_row,
+                local_col,
+                global_offset[global_index],
+                global_state,
+                global_acc,
+                True,
+            )
+
+    for k in range(source_index.shape[0]):
+        global_index = source_index[k]
+        global_row = global_index // (global_state.num_cols * chunk_size)
+        global_col = global_index % (global_state.num_cols * chunk_size)
+        local_row = global_row - tile_row * chunk_size
+        local_col = global_col - tile_col * chunk_size
+        if 0 <= local_row < rows and 0 <= local_col < cols:
+            _walk_offset_downstream(
+                flow_acc,
+                flow_dir,
+                tile_row,
+                tile_col,
+                local_row,
+                local_col,
+                source_value[k],
+                global_state,
+                global_acc,
+                False,
+            )
 
     return flow_acc, tile_row, tile_col
+
+
+@njit(nogil=True)
+def find_tile_exit(flow_dir: np.ndarray, row: int, col: int):
+    """
+    Follow flow from a cell within a tile until it leaves the tile.
+
+    Args:
+        flow_dir (np.ndarray): Flow direction data for the tile.
+        row (int): Starting row within the tile.
+        col (int): Starting column within the tile.
+
+    Returns:
+        tuple: (exit_row, exit_col, exited). When exited is True, (exit_row,
+            exit_col) is the out-of-tile cell the flow enters next. When False,
+            the flow terminates inside the tile (or hits a cycle) and the
+            exit coordinates are meaningless.
+    """
+    rows, cols = flow_dir.shape
+    current_row, current_col = row, col
+    current_dir = flow_dir[current_row, current_col]
+    max_iterations = rows * cols
+    iterations = 0
+    while current_dir not in (FLOW_DIRECTION_NODATA, FLOW_DIRECTION_UNDEFINED):
+        iterations += 1
+        if iterations > max_iterations:
+            return 0, 0, False
+        next_row, next_col, next_dir = get_next_cell(
+            flow_dir, current_row, current_col
+        )
+        if next_row < 0 or next_row >= rows or next_col < 0 or next_col >= cols:
+            return next_row, next_col, True
+        current_row, current_col, current_dir = next_row, next_col, next_dir
+    return 0, 0, False
 
 
 @njit(nogil=True)
@@ -233,11 +315,13 @@ def finalize_flow_accumulation_weighted(
     tile_row: int,
     tile_col: int,
     global_state: WeightedGlobalState,
+    source_index: np.ndarray,
+    source_value: np.ndarray,
 ):
     """
     Finalize weighted flow accumulation for a tile using global accumulation data.
 
-    Same as `finalize_flow_accumulation`, except the early-break check uses
+    Same as `finalize_flow_accumulation`, except walks stop on cells flagged in
     `global_acc_is_external` instead of `global_acc[...] != 0`: in weighted
     "zero" nodata mode a legitimate all-zero-weight upstream area can produce
     a real 0.0 accumulation, which the unweighted `!= 0` check would
@@ -253,6 +337,8 @@ def finalize_flow_accumulation_weighted(
         tile_row (int): Row index of the tile.
         tile_col (int): Column index of the tile.
         global_state (WeightedGlobalState): Global state object containing grid information.
+        source_index (np.ndarray): Global indices of upstream source cells.
+        source_value (np.ndarray): Upstream source values, aligned with source_index.
 
     Returns:
         tuple: Updated flow accumulation array and tile indices.
@@ -260,70 +346,138 @@ def finalize_flow_accumulation_weighted(
     rows, cols = flow_acc.shape
     chunk_size = global_state.chunk_size
 
-    # Process each entry in the global accumulation and offset
     for global_index in global_offset:
-        # Convert global index to local tile coordinates
         global_row = global_index // (global_state.num_cols * chunk_size)
         global_col = global_index % (global_state.num_cols * chunk_size)
         local_row = global_row - tile_row * chunk_size
         local_col = global_col - tile_col * chunk_size
-
-        # Check if the cell is within this tile
         if 0 <= local_row < rows and 0 <= local_col < cols:
-            # Propagate the additional accumulation downstream
-            current_row, current_col = local_row, local_col
-            # sentinel must not collide with out-of-tile coordinates
-            prev_row, prev_col = -9999, -9999
-            current_dir = flow_dir[current_row, current_col]
-            # Cycle detection: no valid path should exceed total cells in tile
-            max_iterations = rows * cols
-            iterations = 0
-            while current_dir not in (FLOW_DIRECTION_NODATA, FLOW_DIRECTION_UNDEFINED):
-                iterations += 1
-                if iterations > max_iterations:
-                    # Cycle detected - stop propagation
-                    print(
-                        "Warning: Cycle detected in flow direction data during finalization. tile:",
-                        tile_row,
-                        tile_col,
-                        "cell:",
-                        current_row,
-                        current_col,
-                    )
-                    break
-                # Bounds check: ensure we're still within the tile
-                if not (0 <= current_row < rows and 0 <= current_col < cols):
-                    break
-                flow_acc[current_row, current_col] += global_offset[global_index]
-                next_row, next_col, next_dir = get_next_cell(
-                    flow_dir, current_row, current_col
-                )
-                if next_row == prev_row and next_col == prev_col:
-                    # The current cell and the previous cell point at each
-                    # other: a two-cell cycle. Stop before applying the offset
-                    # to the pair again and again until max_iterations.
-                    print(
-                        "Warning: Cycle detected in flow direction data during finalization. tile:",
-                        tile_row,
-                        tile_col,
-                        "cell:",
-                        current_row,
-                        current_col,
-                    )
-                    break
-                prev_row, prev_col = current_row, current_col
-                current_row, current_col, current_dir = next_row, next_col, next_dir
-                next_global_index = global_state.get_global_cell_index(
-                    tile_row, tile_col, current_row, current_col
-                )
-                if (
-                    next_global_index in global_acc_is_external
-                    and global_acc_is_external[next_global_index]
-                ):
-                    # Flow reaches a cell accounted for in global accumulation
-                    break
+            _walk_offset_downstream(
+                flow_acc,
+                flow_dir,
+                tile_row,
+                tile_col,
+                local_row,
+                local_col,
+                global_offset[global_index],
+                global_state,
+                global_acc_is_external,
+                True,
+            )
+
+    for k in range(source_index.shape[0]):
+        global_index = source_index[k]
+        global_row = global_index // (global_state.num_cols * chunk_size)
+        global_col = global_index % (global_state.num_cols * chunk_size)
+        local_row = global_row - tile_row * chunk_size
+        local_col = global_col - tile_col * chunk_size
+        if 0 <= local_row < rows and 0 <= local_col < cols:
+            _walk_offset_downstream(
+                flow_acc,
+                flow_dir,
+                tile_row,
+                tile_col,
+                local_row,
+                local_col,
+                source_value[k],
+                global_state,
+                global_acc_is_external,
+                False,
+            )
 
     return flow_acc, tile_row, tile_col
+
+
+def _compute_upstream_injections(
+    upstream_sources: dict[tuple[int, int], int] | None,
+    input_band,
+    chunk_size: int,
+    global_state,
+    value_dtype,
+):
+    """
+    Locate where upstream-source inflow enters the global graph.
+
+    Each source adds its value to the flow accumulation of every cell downstream
+    of the source. Within the source's own tile this is applied by the finalize
+    walk from the source cell (`source_index`/`source_value`). Once the flow
+    leaves that tile, the value must travel through the global graph like any
+    other inflow, so it is seeded at the entry cell of the neighbouring tile
+    (`exit_offsets`) before the graph is solved.
+
+    Args:
+        upstream_sources (dict | None): (row, col) -> value.
+        input_band: Flow direction raster band, used to read tile flow directions.
+        chunk_size (int): Tile size in pixels.
+        global_state: GlobalState or WeightedGlobalState for the grid.
+        value_dtype: numpy dtype of the accumulation values.
+
+    Returns:
+        tuple: (source_index, source_value, exit_offsets, inject_index, inject_value).
+            source_index/source_value are the walk starts applied per tile.
+            exit_offsets is a dict of entry global index -> value. inject_index/
+            inject_value are the same entries as arrays to seed the graph solve.
+    """
+    source_offsets: dict[int, float] = {}
+    exit_offsets: dict[int, float] = {}
+    tile_cache: dict[tuple[int, int], np.ndarray] = {}
+
+    if upstream_sources:
+        for (row, col), value in upstream_sources.items():
+            tile_row = row // chunk_size
+            tile_col = col // chunk_size
+            local_row = row % chunk_size
+            local_col = col % chunk_size
+            global_index = global_state.get_global_cell_index(
+                tile_row, tile_col, local_row, local_col
+            )
+            if global_index == -1:
+                continue
+            source_offsets[global_index] = source_offsets.get(global_index, 0) + value
+
+            key = (tile_row, tile_col)
+            if key not in tile_cache:
+                flow_dir_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
+                flow_dir_tile.read(input_band)
+                tile_cache[key] = flow_dir_tile.data
+            exit_row, exit_col, exited = find_tile_exit(
+                tile_cache[key], local_row, local_col
+            )
+            if not exited:
+                continue
+
+            next_tile_row, next_tile_col = global_state.get_neighboring_tile(
+                tile_row, tile_col, exit_row, exit_col
+            )
+            next_local_row, next_local_col = global_state.adjust_coordinates(
+                exit_row, exit_col
+            )
+            next_global_index = global_state.get_global_cell_index(
+                next_tile_row, next_tile_col, next_local_row, next_local_col
+            )
+            if next_global_index == -1:
+                continue
+            exit_offsets[next_global_index] = (
+                exit_offsets.get(next_global_index, 0) + value
+            )
+
+    source_index = np.array(list(source_offsets.keys()), dtype=np.int64)
+    source_value = np.array(list(source_offsets.values()), dtype=value_dtype)
+    inject_index = np.array(list(exit_offsets.keys()), dtype=np.int64)
+    inject_value = np.array(list(exit_offsets.values()), dtype=value_dtype)
+    return source_index, source_value, exit_offsets, inject_index, inject_value
+
+
+def _apply_upstream_sources(global_offset, exit_offsets) -> None:
+    """
+    Add upstream inflow for entry cells that are not part of the solved graph.
+
+    Entry cells already in the graph received their inflow during the solve.
+    Any other entry cell is added here so its finalize walk applies the inflow.
+    """
+    for index, value in exit_offsets.items():
+        if index not in global_offset:
+            global_offset[index] = value
 
 
 def _flow_accumulation_tiled(
@@ -331,6 +485,7 @@ def _flow_accumulation_tiled(
     output_path: str,
     chunk_size: int,
     progress_callback: ProgressCallback | None = None,
+    upstream_sources: dict[tuple[int, int], int] | None = None,
 ) -> None:
     """
     Compute flow accumulation using a tiled approach for large rasters.
@@ -425,7 +580,15 @@ def _flow_accumulation_tiled(
 
     # Calculate global accumulation
     tracker.update(2, step_name="Calculate global accumulation")
-    global_acc, global_offset, _ = global_state.calculate_global_accumulation()
+    source_index, source_value, exit_offsets, inject_index, inject_value = (
+        _compute_upstream_injections(
+            upstream_sources, input_band, chunk_size, global_state, np.int64
+        )
+    )
+    global_acc, global_offset, _ = global_state.calculate_global_accumulation(
+        inject_index, inject_value
+    )
+    _apply_upstream_sources(global_offset, exit_offsets)
 
     chunk_counter_finalize = [0]  # Use list for mutability in closure
 
@@ -469,6 +632,8 @@ def _flow_accumulation_tiled(
                 flow_acc_tile.row,
                 flow_acc_tile.col,
                 global_state,
+                source_index,
+                source_value,
             )
             future.add_done_callback(handle_finalize_flow_acc_result)
 
@@ -601,6 +766,7 @@ def _flow_accumulation_weighted_tiled(
     chunk_size: int,
     weights_nodata_mode: str = "zero",
     progress_callback: ProgressCallback | None = None,
+    upstream_sources: dict[tuple[int, int], int] | None = None,
 ) -> None:
     """
     Compute weighted flow accumulation using a tiled approach for large rasters.
@@ -714,9 +880,15 @@ def _flow_accumulation_weighted_tiled(
 
     # Calculate global accumulation
     tracker.update(2, step_name="Calculate global accumulation")
-    global_acc, global_offset, global_acc_is_external = (
-        global_state.calculate_global_accumulation()
+    source_index, source_value, exit_offsets, inject_index, inject_value = (
+        _compute_upstream_injections(
+            upstream_sources, input_band, chunk_size, global_state, np.float64
+        )
     )
+    global_acc, global_offset, global_acc_is_external = (
+        global_state.calculate_global_accumulation(inject_index, inject_value)
+    )
+    _apply_upstream_sources(global_offset, exit_offsets)
 
     chunk_counter_finalize = [0]  # Use list for mutability in closure
 
@@ -764,6 +936,8 @@ def _flow_accumulation_weighted_tiled(
                 flow_acc_tile.row,
                 flow_acc_tile.col,
                 global_state,
+                source_index,
+                source_value,
             )
             future.add_done_callback(handle_finalize_flow_acc_result)
 

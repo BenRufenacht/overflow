@@ -185,6 +185,7 @@ def fill(
     working_dir: str | None = None,
     fill_holes: bool = False,
     progress_callback: ProgressCallback | None = None,
+    max_fill_depth: float | None = None,
 ) -> None:
     """
     Fill depressions in a DEM using priority flood algorithm.
@@ -203,9 +204,14 @@ def fill(
         fill_holes: If True, also fills holes (nodata regions) in the DEM.
         progress_callback: Optional callback function for progress reporting.
             Receives a float value between 0 and 1.
+        max_fill_depth: Maximum fill depth in the DEM's vertical units, measured
+            above the lowest elevation within each sink. If None, depressions are
+            filled to their spill points.
     """
+    if max_fill_depth is not None and max_fill_depth < 0:
+        raise ValueError("max_fill_depth must be greater than or equal to 0")
     if chunk_size <= 1:
-        _fill_depressions(input_path, output_path, fill_holes)
+        _fill_depressions(input_path, output_path, fill_holes, max_fill_depth)
     else:
         _fill_depressions_tiled(
             input_path,
@@ -214,6 +220,7 @@ def fill(
             working_dir,
             fill_holes,
             progress_callback,
+            max_fill_depth,
         )
 
 
@@ -275,6 +282,8 @@ def accumulation(
     weights_path: str | None = None,
     weights_nodata_mode: str = "zero",
     progress_callback: ProgressCallback | None = None,
+    upstream_sources_path: str | None = None,
+    upstream_sources_field: str | None = None,
 ) -> None:
     """
     Calculate flow accumulation from a flow direction raster.
@@ -300,11 +309,27 @@ def accumulation(
         progress_callback: Optional callback function for progress reporting.
             Receives a float value between 0 and 1.
     """
+    upstream_sources = None
+    if upstream_sources_path is not None:
+        from overflow._flow_accumulation.core.flow_accumulation import (
+            _read_upstream_sources,
+        )
+
+        upstream_sources = _read_upstream_sources(
+            input_path,
+            upstream_sources_path,
+            upstream_sources_field,
+        )
+
     if weights_path is not None:
         _validate_raster_compatibility(input_path, weights_path)
         if chunk_size <= 1:
             _flow_accumulation_weighted(
-                input_path, weights_path, output_path, weights_nodata_mode
+                input_path,
+                weights_path,
+                output_path,
+                weights_nodata_mode,
+                upstream_sources=upstream_sources,
             )
         else:
             _flow_accumulation_weighted_tiled(
@@ -314,11 +339,18 @@ def accumulation(
                 chunk_size,
                 weights_nodata_mode,
                 progress_callback,
+                upstream_sources,
             )
     elif chunk_size <= 1:
-        _flow_accumulation(input_path, output_path)
+        _flow_accumulation(input_path, output_path, upstream_sources=upstream_sources)
     else:
-        _flow_accumulation_tiled(input_path, output_path, chunk_size, progress_callback)
+        _flow_accumulation_tiled(
+            input_path,
+            output_path,
+            chunk_size,
+            progress_callback,
+            upstream_sources,
+        )
 
 
 def basins(

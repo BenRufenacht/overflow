@@ -69,6 +69,7 @@ overflow [COMMAND] [OPTIONS]
 | `--chunk_size` | INTEGER | 2048 | No | Chunk size (use \<= 1 for in-memory processing).  |
 | `--working_dir` | TEXT | None | No | Working directory for temporary files.  |
 | `--fill_holes` | FLAG | False | No | If set, fills holes (nodata regions) in the DEM.  |
+| `--max_fill_depth` | FLOAT | None | No | Maximum fill depth in the DEM's vertical units above each sink's lowest elevation. If omitted, fill to the spill elevation.  |
 
 -----
 
@@ -129,6 +130,8 @@ overflow [COMMAND] [OPTIONS]
 | `--input_file` | TEXT | - | **Yes** | Path to the GDAL supported raster dataset for the flow direction raster.  |
 | `--output_file` | TEXT | - | **Yes** | Path to the output file (must be GeoTiff).  |
 | `--chunk_size` | INTEGER | 2048 | No | Chunk size (use \<= 1 for in-memory processing).  |
+| `--upstream_sources_file` | TEXT | None | No | Optional point vector dataset containing integer inflow values to apply at the raster cell containing each point. Point locations outside the raster are ignored with a warning.  |
+| `--upstream_sources_field` | TEXT | None | No | Attribute field in `--upstream_sources_file` containing the integer value to add. Defaults to standard names such as `value` or `accumulation`.  |
 
 -----
 

@@ -9,7 +9,8 @@ from threading import Lock
 
 import numba
 import numpy as np
-from numba import njit, prange  # type: ignore[attr-defined]
+from numba import njit, prange, types  # type: ignore[attr-defined]
+from numba.typed import Dict
 from osgeo import gdal
 
 from overflow._fill_depressions.core import make_sides, priority_flood_tile
@@ -26,6 +27,7 @@ from .global_state import GlobalState
 
 # temporary file for storing labels
 LABELS_FILENAME = "labels.tif"
+ORIGINAL_FILENAME = "original.tif"
 
 
 def setup_working_dir(working_dir: str | None) -> tuple[str, bool]:
@@ -135,9 +137,12 @@ def raise_tile(
     dem: np.ndarray,
     labels: np.ndarray,
     label_min_elevations: dict[int, float],
+    sink_min_elevations,
+    original_tile: np.ndarray,
     tile_row: int,
     tile_col: int,
     no_data_value: float,
+    max_fill_depth: float = -1.0,
 ):
     """
     Raise elevation of dem to match global labels.
@@ -153,8 +158,41 @@ def raise_tile(
                 and dem[row, col] != no_data_value
                 and not np.isnan(dem[row, col])
             ):
-                dem[row, col] = max(label_min_elevations[label], height)
+                target = np.float64(label_min_elevations[label])
+                if (
+                    max_fill_depth >= 0.0
+                    and original_tile[row, col] != no_data_value
+                    and not np.isnan(original_tile[row, col])
+                ):
+                    water = max(np.float64(height), target)
+                    cap = sink_min_elevations[(target, water)] + max_fill_depth
+                    dem[row, col] = max(
+                        np.float64(original_tile[row, col]), min(water, cap)
+                    )
+                else:
+                    dem[row, col] = max(np.float64(height), target)
     return dem, tile_row, tile_col
+
+
+def copy_original_dem(
+    input_band: gdal.Band, working_dir: str, no_data_value: float, chunk_size: int
+) -> tuple[gdal.Dataset, gdal.Band]:
+    """Copy the input DEM to the working directory before filling overwrites it."""
+    input_ds = input_band.GetDataset()
+    original_ds = create_dataset(
+        os.path.join(working_dir, ORIGINAL_FILENAME),
+        no_data_value,
+        input_band.DataType,
+        input_band.XSize,
+        input_band.YSize,
+        input_ds.GetGeoTransform(),
+        input_ds.GetProjection(),
+    )
+    original_band = original_ds.GetRasterBand(1)
+    for tile in raster_chunker(input_band, chunk_size):
+        tile.write(original_band)
+    original_band.FlushCache()
+    return original_ds, original_band
 
 
 def _fill_depressions_tiled(
@@ -164,6 +202,7 @@ def _fill_depressions_tiled(
     working_dir: str | None,
     fill_holes: bool = False,
     progress_callback: ProgressCallback | None = None,
+    max_fill_depth: float | None = None,
 ) -> None:
     """
     Fill depressions in a digital elevation model (DEM) using a parallel tiled approach.
@@ -236,6 +275,11 @@ def _fill_depressions_tiled(
     global_state, input_band, output_band, labels_band = init_global_state(
         dem_ds, output_ds, labels_ds, no_data_value, chunk_size
     )
+    original_ds, original_band = (
+        copy_original_dem(input_band, working_dir, no_data_value, chunk_size)
+        if max_fill_depth is not None and max_fill_depth >= 0.0
+        else (None, None)
+    )
 
     # Threading setup
     max_workers = numba.config.NUMBA_NUM_THREADS  # type: ignore[attr-defined]
@@ -248,20 +292,26 @@ def _fill_depressions_tiled(
         input_band.XSize / chunk_size
     )
 
+    errors: list[BaseException] = []
+
     def handle_fill_tile_result(future):
-        labels, dem, graph, tile_row, tile_col = future.result()
-        with lock:
-            global_state.graph.update(graph)
-            labels_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
-            labels_tile.from_numpy(labels)
-            labels_tile.write(labels_band)
-            dem_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
-            dem_tile.from_numpy(dem)
-            dem_tile.write(output_band)
+        try:
+            labels, dem, graph, tile_row, tile_col = future.result()
+            with lock:
+                global_state.graph.update(graph)
+                labels_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
+                labels_tile.from_numpy(labels)
+                labels_tile.write(labels_band)
+                dem_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
+                dem_tile.from_numpy(dem)
+                dem_tile.write(output_band)
+                # Report progress as tiles complete
+                chunk_counter[0] += 1
+                tracker.callback(message=f"Chunk {chunk_counter[0]}/{total_chunks}")
+        except BaseException as error:
+            errors.append(error)
+        finally:
             task_queue.get()
-            # Report progress as tiles complete
-            chunk_counter[0] += 1
-            tracker.callback(message=f"Chunk {chunk_counter[0]}/{total_chunks}")
 
     tracker.update(1, step_name="Fill locally")
 
@@ -283,6 +333,8 @@ def _fill_depressions_tiled(
     # wait for all tasks to finish
     while not task_queue.empty():
         time.sleep(0.1)
+    if errors:
+        raise errors[0]
 
     # flush cache between writing and reading
     labels_band.FlushCache()
@@ -294,20 +346,73 @@ def _fill_depressions_tiled(
     tracker.update(2, step_name="Solve graph")
     global_state.connect_tile_edges_and_corners()
     label_min_elevations = global_state.solve_graph()
+    # A lake is the set of cells sharing a label level L (the solved label
+    # level) and a water surface F = max(filled height, L). Its low point is
+    # the lowest original elevation among its cells, across all tiles.
+    lake_sink_min: dict[tuple[float, float], float] = {}
+    if original_band is not None:
+        for dem_tile in raster_chunker(original_band, chunk_size):
+            tile_labels = RasterChunk(dem_tile.row, dem_tile.col, chunk_size, 0)
+            tile_labels.read(labels_band)
+            tile_filled = RasterChunk(dem_tile.row, dem_tile.col, chunk_size, 0)
+            tile_filled.read(output_band)
+            valid = (
+                (tile_labels.data != 0)
+                & (dem_tile.data != no_data_value)
+                & ~np.isnan(dem_tile.data)
+                & (tile_filled.data != no_data_value)
+                & ~np.isnan(tile_filled.data)
+            )
+            if not valid.any():
+                continue
+            labels_valid = tile_labels.data[valid].astype(np.int64)
+            unique_labels, inverse = np.unique(labels_valid, return_inverse=True)
+            unique_levels = np.array(
+                [float(label_min_elevations[int(label)]) for label in unique_labels],
+                dtype=np.float64,
+            )
+            level = unique_levels[inverse.reshape(-1)]
+            water = np.maximum(tile_filled.data[valid].astype(np.float64), level)
+            values = dem_tile.data[valid].astype(np.float64)
+            order = np.lexsort((water, level))
+            s_level = level[order]
+            s_water = water[order]
+            s_values = values[order]
+            starts = np.flatnonzero(
+                np.r_[
+                    True,
+                    (s_level[1:] != s_level[:-1]) | (s_water[1:] != s_water[:-1]),
+                ]
+            )
+            lowest = np.minimum.reduceat(s_values, starts)
+            for lv, wt, low in zip(s_level[starts], s_water[starts], lowest):
+                key = (float(lv), float(wt))
+                if key not in lake_sink_min or float(low) < lake_sink_min[key]:
+                    lake_sink_min[key] = float(low)
+
+    sink_min_elevations = Dict.empty(
+        key_type=types.UniTuple(types.float64, 2), value_type=types.float64
+    )
+    for key, lowest in lake_sink_min.items():
+        sink_min_elevations[key] = lowest
 
     # raise elevation of dem to match global labels
     chunk_counter_raise = [0]  # Use list for mutability in closure
 
     def handle_raise_tile_result(future):
-        with lock:
-            dem, tile_row, tile_col = future.result()
-            dem_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
-            dem_tile.from_numpy(dem)
-            dem_tile.write(output_band)
+        try:
+            with lock:
+                dem, tile_row, tile_col = future.result()
+                dem_tile = RasterChunk(tile_row, tile_col, chunk_size, 0)
+                dem_tile.from_numpy(dem)
+                dem_tile.write(output_band)
+                # Report progress as tiles complete
+                chunk_counter_raise[0] += 1
+                tracker.callback(message=f"Chunk {chunk_counter_raise[0]}/{total_chunks}")
+        except BaseException as error:
+            errors.append(error)
+        finally:
             task_queue.get()
-            # Report progress as tiles complete
-            chunk_counter_raise[0] += 1
-            tracker.callback(message=f"Chunk {chunk_counter_raise[0]}/{total_chunks}")
 
     tracker.update(3, step_name="Apply elevations")
 
@@ -318,20 +423,32 @@ def _fill_depressions_tiled(
             task_queue.put(0)
             tile_labels = RasterChunk(dem_tile.row, dem_tile.col, chunk_size, 0)
             tile_labels.read(labels_band)
+            tile_original = dem_tile.data
+            if original_band is not None:
+                original_chunk = RasterChunk(dem_tile.row, dem_tile.col, chunk_size, 0)
+                original_chunk.read(original_band)
+                tile_original = original_chunk.data
             future = executor.submit(
                 raise_tile,
                 dem_tile.data,
                 tile_labels.data,
                 label_min_elevations,
+                sink_min_elevations,
+                tile_original,
                 dem_tile.row,
                 dem_tile.col,
                 global_state.no_data,
+                max_fill_depth if max_fill_depth is not None else -1.0,
             )
             future.add_done_callback(handle_raise_tile_result)
 
     while not task_queue.empty():
         time.sleep(0.1)
+    if errors:
+        raise errors[0]
 
+    original_band = None
+    original_ds = None
     labels_ds.Close()
     output_ds.Close()
     if output_ds is not dem_ds:

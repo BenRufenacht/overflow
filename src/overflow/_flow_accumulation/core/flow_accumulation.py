@@ -1,6 +1,9 @@
+import math
+import warnings
+
 import numpy as np
 from numba import njit  # type: ignore[attr-defined]
-from osgeo import gdal
+from osgeo import gdal, ogr, osr
 
 from overflow._util.constants import (
     FLOW_ACCUMULATION_NODATA,
@@ -158,6 +161,7 @@ def single_tile_flow_accumulation(
     create_links: bool = True,
     tile_row: int = 0,
     tile_col: int = 0,
+    upstream_sources: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Calculate flow accumulation for a single tile.
        This is Algorithm 1 from https://arxiv.org/pdf/1608.04431.pdf R. Barnes
@@ -172,6 +176,15 @@ def single_tile_flow_accumulation(
     """
     # the output flow accumulation raster
     flow_accumulation = np.zeros_like(flow_direction, dtype=np.int64)
+    if upstream_sources is not None and upstream_sources.size > 0:
+        for i in range(upstream_sources.shape[0]):
+            row = upstream_sources[i, 0]
+            col = upstream_sources[i, 1]
+            value = upstream_sources[i, 2]
+            if 0 <= row < flow_direction.shape[0] and 0 <= col < flow_direction.shape[1]:
+                if flow_direction[row, col] == FLOW_DIRECTION_NODATA:
+                    continue
+                flow_accumulation[row, col] += value
     # a dependency raster (number of neighbors that flow into each cell)
     inflow_count = np.zeros_like(flow_direction, dtype=np.uint8)
 
@@ -189,12 +202,39 @@ def single_tile_flow_accumulation(
     queue = Queue([(0, 0)])
     queue.pop()
 
-    # Populate initial queue with cells that have no inflow
+    source_count = 0
+    if upstream_sources is not None and upstream_sources.size > 0:
+        source_count = upstream_sources.shape[0]
+    source_rows = np.empty((source_count, 2), dtype=np.int64)
+    valid_source_count = 0
+    if upstream_sources is not None and upstream_sources.size > 0:
+        for i in range(upstream_sources.shape[0]):
+            row = upstream_sources[i, 0]
+            col = upstream_sources[i, 1]
+            if 0 <= row < flow_direction.shape[0] and 0 <= col < flow_direction.shape[1]:
+                source_rows[valid_source_count, 0] = row
+                source_rows[valid_source_count, 1] = col
+                valid_source_count += 1
+
+    # Populate initial queue with any injected upstream sources and then with
+    # cells that have no inflow.
+    for i in range(valid_source_count):
+        row = source_rows[i, 0]
+        col = source_rows[i, 1]
+        if flow_accumulation[row, col] != FLOW_ACCUMULATION_NODATA:
+            queue.push((row, col))
+
     for row, col in np.ndindex(inflow_count.shape):
         _, _, next_value = get_next_cell(flow_direction, row, col)
+        is_source = False
+        for i in range(valid_source_count):
+            if source_rows[i, 0] == row and source_rows[i, 1] == col:
+                is_source = True
+                break
         if (
             inflow_count[row, col] == 0
             and flow_accumulation[row, col] != FLOW_ACCUMULATION_NODATA
+            and not is_source
         ):
             queue.push((row, col))
 
@@ -236,6 +276,7 @@ def single_tile_flow_accumulation_weighted(
     create_links: bool = True,
     tile_row: int = 0,
     tile_col: int = 0,
+    upstream_sources: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Calculate weighted flow accumulation for a single tile: instead of
        counting cells, sums the weights raster over each cell's upstream
@@ -271,6 +312,15 @@ def single_tile_flow_accumulation_weighted(
 
     # the output flow accumulation raster
     flow_accumulation = np.zeros_like(flow_direction, dtype=np.float64)
+    if upstream_sources is not None and upstream_sources.size > 0:
+        for i in range(upstream_sources.shape[0]):
+            row = upstream_sources[i, 0]
+            col = upstream_sources[i, 1]
+            value = upstream_sources[i, 2]
+            if 0 <= row < flow_direction.shape[0] and 0 <= col < flow_direction.shape[1]:
+                if flow_direction[row, col] == FLOW_DIRECTION_NODATA:
+                    continue
+                flow_accumulation[row, col] += value
     # a dependency raster (number of neighbors that flow into each cell)
     inflow_count = np.zeros_like(flow_direction, dtype=np.uint8)
 
@@ -288,10 +338,40 @@ def single_tile_flow_accumulation_weighted(
     queue = Queue([(0, 0)])
     queue.pop()
 
-    # Populate initial queue with cells that have no inflow
+    source_count = 0
+    if upstream_sources is not None and upstream_sources.size > 0:
+        source_count = upstream_sources.shape[0]
+    source_rows = np.empty((source_count, 2), dtype=np.int64)
+    valid_source_count = 0
+    if upstream_sources is not None and upstream_sources.size > 0:
+        for i in range(upstream_sources.shape[0]):
+            row = upstream_sources[i, 0]
+            col = upstream_sources[i, 1]
+            if 0 <= row < flow_direction.shape[0] and 0 <= col < flow_direction.shape[1]:
+                source_rows[valid_source_count, 0] = row
+                source_rows[valid_source_count, 1] = col
+                valid_source_count += 1
+
+    # Populate initial queue with any injected upstream sources and then with
+    # cells that have no inflow.
+    for i in range(valid_source_count):
+        row = source_rows[i, 0]
+        col = source_rows[i, 1]
+        if not np.isnan(flow_accumulation[row, col]):
+            queue.push((row, col))
+
     for row, col in np.ndindex(inflow_count.shape):
         _, _, next_value = get_next_cell(flow_direction, row, col)
-        if inflow_count[row, col] == 0 and not np.isnan(flow_accumulation[row, col]):
+        is_source = False
+        for i in range(valid_source_count):
+            if source_rows[i, 0] == row and source_rows[i, 1] == col:
+                is_source = True
+                break
+        if (
+            inflow_count[row, col] == 0
+            and not np.isnan(flow_accumulation[row, col])
+            and not is_source
+        ):
             queue.push((row, col))
 
     # main loop
@@ -323,6 +403,222 @@ def single_tile_flow_accumulation_weighted(
     return flow_accumulation, links
 
 
+def _parse_upstream_sources_field(
+    layer: ogr.Layer, upstream_sources_field: str | None = None
+) -> str:
+    """Resolve the field name used to store integer accumulation values."""
+    field_count = layer.GetLayerDefn().GetFieldCount()
+    if field_count == 0:
+        raise ValueError(
+            "Upstream source dataset does not contain any attribute fields; "
+            "provide a field with integer accumulation values."
+        )
+
+    candidates = [
+        "value",
+        "accumulation",
+        "upstream_value",
+        "source_value",
+        "fac",
+        "weight",
+        "contribution",
+    ]
+    if upstream_sources_field is not None:
+        candidates = [upstream_sources_field, *candidates]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for field_index in range(field_count):
+            field_defn = layer.GetLayerDefn().GetFieldDefn(field_index)
+            if field_defn.GetName().lower() == candidate.lower():
+                return field_defn.GetName()
+
+    if upstream_sources_field is not None:
+        raise ValueError(
+            f"Upstream source field '{upstream_sources_field}' was not found in the "
+            "input vector dataset."
+        )
+
+    raise ValueError(
+        "Upstream source dataset does not contain a recognized integer value "
+        "field. Supply upstream_sources_field with a field name like 'value'."
+    )
+
+
+def _snap_point_to_boundaries(
+    x: float,
+    y: float,
+    transform: tuple[float, ...],
+    rows: int,
+    cols: int,
+    flow_direction: np.ndarray | None = None,
+) -> tuple[int, int]:
+    """Map a point to the raster cell that contains it.
+
+    This is a simple point-in-raster lookup for upstream inflow sources. If the
+    point lies outside the raster extent, it is treated as invalid and is
+    ignored upstream.
+    """
+    inv_transform = gdal.InvGeoTransform(transform)
+    if inv_transform == (None, None, None, None, None, None):
+        raise ValueError("Could not invert flow direction raster geotransform.")
+
+    cell_x, cell_y = gdal.ApplyGeoTransform(inv_transform, x, y)
+    row = int(math.floor(cell_y))
+    col = int(math.floor(cell_x))
+
+    if row < 0 or row >= rows or col < 0 or col >= cols:
+        raise ValueError(
+            f"Upstream source at point ({x}, {y}) is outside the flow direction raster; "
+            "ignoring this source."
+        )
+
+    return row, col
+
+
+def _coerce_upstream_value(feature: ogr.Feature, field_name: str) -> int:
+    """Validate that an upstream source value is integer-like."""
+    field_index = feature.GetFieldIndex(field_name)
+    if field_index < 0:
+        raise ValueError(f"Upstream source field '{field_name}' not found.")
+
+    value = feature.GetField(field_name)
+    if value is None:
+        raise ValueError(f"Upstream source feature has a null value in field '{field_name}'.")
+
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Upstream source field '{field_name}' must contain numeric values."
+        ) from exc
+
+    if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+        raise ValueError(
+            f"Upstream source field '{field_name}' must contain integer values only; "
+            f"floating-point sources are not allowed."
+        )
+    return int(numeric_value)
+
+
+def _read_upstream_sources(
+    fdr_path: str,
+    upstream_sources_path: str,
+    upstream_sources_field: str | None = None,
+) -> dict[tuple[int, int], int]:
+    """Read and snap an OGR point source dataset to nearest edge cells."""
+    fdr_ds = gdal.Open(fdr_path)
+    if fdr_ds is None:
+        raise ValueError(f"Could not open flow direction raster '{fdr_path}'.")
+
+    source_ds = ogr.Open(upstream_sources_path)
+    if source_ds is None:
+        raise ValueError(f"Could not open upstream source dataset '{upstream_sources_path}'.")
+
+    source_layer = source_ds.GetLayer()
+    if source_layer is None:
+        raise ValueError(f"No vector layer found in '{upstream_sources_path}'.")
+
+    geom_type = source_layer.GetGeomType()
+    if geom_type not in {
+        ogr.wkbPoint,
+        ogr.wkbPoint25D,
+        ogr.wkbMultiPoint,
+        ogr.wkbMultiPoint25D,
+    }:
+        raise ValueError(
+            "Upstream source dataset must be a point vector layer; "
+            f"found geometry type {geom_type}."
+        )
+
+    field_name = _parse_upstream_sources_field(source_layer, upstream_sources_field)
+    transform = fdr_ds.GetGeoTransform()
+    inv_transform = gdal.InvGeoTransform(transform)
+    if inv_transform == (None, None, None, None, None, None):
+        raise ValueError("Could not invert flow direction raster geotransform.")
+    inv_transform = tuple(inv_transform)
+    rows = fdr_ds.RasterYSize
+    cols = fdr_ds.RasterXSize
+    fdr_band = fdr_ds.GetRasterBand(1)
+    fdr_array = fdr_band.ReadAsArray()
+
+    source_map: dict[tuple[int, int], int] = {}
+    layer_srs = source_layer.GetSpatialRef()
+    raster_projection = fdr_ds.GetProjection()
+    raster_srs = None
+    if raster_projection and raster_projection.strip():
+        raster_srs = osr.SpatialReference()
+        raster_srs.ImportFromWkt(raster_projection)
+
+    for feature in source_layer:
+        geom = feature.GetGeometryRef()
+        if geom is None:
+            continue
+
+        geom_type = geom.GetGeometryType()
+        if geom_type in (ogr.wkbPoint, ogr.wkbPoint25D):
+            points = [(geom.GetX(), geom.GetY())]
+        elif geom_type in (ogr.wkbMultiPoint, ogr.wkbMultiPoint25D):
+            points = []
+            for i in range(geom.GetGeometryCount()):
+                part = geom.GetGeometryRef(i)
+                if part is not None:
+                    points.append((part.GetX(), part.GetY()))
+        else:
+            raise ValueError(
+                "Each upstream source feature must be a point or multipoint geometry. "
+                f"Feature {feature.GetFID()} is geometry type {geom_type}."
+            )
+
+        for x, y in points:
+            if layer_srs is not None and raster_srs is not None:
+                if not layer_srs.IsSame(raster_srs):
+                    source_srs = osr.SpatialReference()
+                    source_srs.ImportFromWkt(layer_srs.ExportToWkt())
+                    source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                    raster_srs.SetAxisMappingStrategy(
+                        osr.OAMS_TRADITIONAL_GIS_ORDER
+                    )
+                    transform_to_raster = osr.CoordinateTransformation(
+                        source_srs, raster_srs
+                    )
+                    x, y, _ = transform_to_raster.TransformPoint(x, y)
+
+            try:
+                snapped_row, snapped_col = _snap_point_to_boundaries(
+                    x, y, transform, rows, cols, fdr_array
+                )
+            except ValueError:
+                warnings.warn(
+                    "Upstream source at point "
+                    f"({x}, {y}) is outside the flow direction raster; "
+                    "ignoring this source.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+
+            if not (0 <= snapped_row < rows and 0 <= snapped_col < cols):
+                continue
+
+            source_value = _coerce_upstream_value(feature, field_name)
+            cell_key = (snapped_row, snapped_col)
+            previous = source_map.get(cell_key, 0)
+            if cell_key in source_map:
+                warnings.warn(
+                    "Duplicate upstream source contribution snapped to the same boundary cell "
+                    f"({snapped_row}, {snapped_col}); summing values.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            source_map[cell_key] = previous + source_value
+
+    source_ds = None
+    fdr_ds = None
+    return source_map
+
+
 def _parse_weights_nodata_mode(mode: str) -> int:
     """Translate the public string weights_nodata_mode API into the internal
     int flags consumed by the njit-compiled weighted accumulation functions.
@@ -345,11 +641,26 @@ def _parse_weights_nodata_mode(mode: str) -> int:
     )
 
 
+def _upstream_sources_to_array(
+    upstream_sources: dict[tuple[int, int], int] | None,
+) -> np.ndarray:
+    """Convert the public source dictionary into a 2D int64 array for Numba."""
+    if not upstream_sources:
+        return np.empty((0, 3), dtype=np.int64)
+    rows = np.empty((len(upstream_sources), 3), dtype=np.int64)
+    for index, ((row, col), value) in enumerate(upstream_sources.items()):
+        rows[index, 0] = row
+        rows[index, 1] = col
+        rows[index, 2] = value
+    return rows
+
+
 def _flow_accumulation_weighted(
     fdr_path: str,
     weights_path: str,
     output_fac_path: str,
     weights_nodata_mode: str = "zero",
+    upstream_sources: dict[tuple[int, int], int] | None = None,
 ) -> None:
     """
     Generates a weighted flow accumulation raster from a flow direction raster
@@ -396,8 +707,14 @@ def _flow_accumulation_weighted(
         projection,
     )
     fac_band = fac_ds.GetRasterBand(1)
+    source_array = _upstream_sources_to_array(upstream_sources)
     fac_array, _ = single_tile_flow_accumulation_weighted(
-        fdr_array, weights_array, weights_nodata, nodata_mode, False
+        fdr_array,
+        weights_array,
+        weights_nodata,
+        nodata_mode,
+        False,
+        upstream_sources=source_array,
     )
     fac_band.WriteArray(fac_array)
     fac_band.FlushCache()
@@ -410,7 +727,11 @@ def _flow_accumulation_weighted(
     weights_ds = None
 
 
-def _flow_accumulation(fdr_path: str, output_fac_path: str) -> None:
+def _flow_accumulation(
+    fdr_path: str,
+    output_fac_path: str,
+    upstream_sources: dict[tuple[int, int], int] | None = None,
+) -> None:
     """
     Generates a flow accumulation raster from a flow direction raster.
 
@@ -420,6 +741,9 @@ def _flow_accumulation(fdr_path: str, output_fac_path: str) -> None:
         Path to the input flow direction raster file.
     output_fac_path : str
         Path to the output flow accumulation raster file.
+    upstream_sources : dict[tuple[int, int], int] | None
+        Optional source-cell contributions to add before the standard
+        propagation pass.
 
     Returns
     -------
@@ -441,7 +765,12 @@ def _flow_accumulation(fdr_path: str, output_fac_path: str) -> None:
         projection,
     )
     fac_band = fac_ds.GetRasterBand(1)
-    fac_array, _ = single_tile_flow_accumulation(fdr_array, False)
+    source_array = _upstream_sources_to_array(upstream_sources)
+    fac_array, _ = single_tile_flow_accumulation(
+        fdr_array,
+        False,
+        upstream_sources=source_array,
+    )
     fac_band.WriteArray(fac_array)
     fac_band.FlushCache()
     fac_ds.FlushCache()

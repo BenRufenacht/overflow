@@ -1,7 +1,8 @@
 from heapq import heappop, heappush
 
 import numpy as np
-from numba import float32, njit  # type: ignore[attr-defined]
+from numba import float32, float64, njit, types  # type: ignore[attr-defined]
+from numba.typed import Dict  # type: ignore[attr-defined]
 from osgeo import gdal
 
 from overflow._fill_depressions.core.watershed_graph import WatershedGraph
@@ -21,6 +22,9 @@ from overflow._util.raster import (
     create_dataset,
     open_dataset,
 )
+
+# Key type for (label, water surface) lake pairs used by the depth cap.
+LAKE_KEY_TYPE = types.UniTuple(float64, 2)
 
 
 @njit
@@ -59,6 +63,7 @@ def priority_flood_tile(
     no_data: float = -9999.0,
     label_offset: np.int64 = 2,  # type: ignore[assignment]
     fill_holes: bool = False,
+    max_fill_depth: float = -1.0,
 ) -> tuple[np.ndarray, WatershedGraph, np.int64]:
     """
     Implementation of the Priority-Flood algorithm for a single tile.
@@ -80,6 +85,7 @@ def priority_flood_tile(
     """
     # TODO: fill_holes=False results in large memory usage and low cpu usage
     # Initialize variables
+    original_dem = dem.copy()
     rows, cols = dem.shape
     labels = np.zeros_like(dem, dtype=np.int64)
     graph = WatershedGraph()
@@ -255,11 +261,49 @@ def priority_flood_tile(
             if label_pair not in graph or dem_c < graph[label_pair]:  # type: ignore[operator, index]
                 graph[label_pair] = dem_c  # type: ignore[index]
 
+    if max_fill_depth >= 0.0:
+        # A lake is the set of cells sharing a label and a water surface (the filled height).
+        # Each lake is capped at its lowest original elevation plus the allowed depth.
+        lake_min_elevations = Dict.empty(
+            key_type=LAKE_KEY_TYPE, value_type=float64
+        )
+        for i in range(rows):
+            for j in range(cols):
+                value = original_dem[i, j]
+                if value == no_data or np.isnan(value):
+                    continue
+                label = labels[i, j]
+                if label == 0 or dem[i, j] == no_data or np.isnan(dem[i, j]):
+                    continue
+                key = (float64(label), float64(dem[i, j]))
+                if key not in lake_min_elevations:
+                    lake_min_elevations[key] = float64(value)
+                elif float64(value) < lake_min_elevations[key]:
+                    lake_min_elevations[key] = float64(value)
+
+        for i in range(rows):
+            for j in range(cols):
+                value = dem[i, j]
+                original_value = original_dem[i, j]
+                if value == no_data or np.isnan(value):
+                    continue
+                label = labels[i, j]
+                if label == 0:
+                    continue
+                key = (float64(label), float64(value))
+                if key not in lake_min_elevations:
+                    continue
+                cap = lake_min_elevations[key] + float64(max_fill_depth)
+                dem[i, j] = max(original_value, min(float64(value), cap))
+
     return labels, graph, label_count
 
 
 def _fill_depressions(
-    dem_file: str, out_file: str | None, fill_holes: bool = False
+    dem_file: str,
+    out_file: str | None,
+    fill_holes: bool = False,
+    max_fill_depth: float | None = None,
 ) -> None:
     """
     Fill depressions in a DEM using the Priority-Flood algorithm.
@@ -269,6 +313,9 @@ def _fill_depressions(
         dem_file (str): Path to the input DEM file.
         out_file (str): Path to the output filled DEM file.
         fill_holes (bool, optional): If True, fills no-data holes. If False, treats them as drainage points. Defaults to False.
+        max_fill_depth (float | None, optional): Maximum depth, in the DEM's
+            vertical units, that a depression may be filled above its lowest
+            elevation. If None, fills depressions completely.
 
     Returns:
         None
@@ -280,7 +327,13 @@ def _fill_depressions(
     dem = dem_band.ReadAsArray()
     no_data = dem_band.GetNoDataValue()
     sides = make_sides()
-    priority_flood_tile(dem, sides, no_data, fill_holes)
+    priority_flood_tile(
+        dem,
+        sides,
+        no_data,
+        fill_holes=fill_holes,
+        max_fill_depth=max_fill_depth if max_fill_depth is not None else -1.0,
+    )
     if out_file is not None:
         out_ds = create_dataset(
             out_file,

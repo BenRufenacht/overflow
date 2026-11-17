@@ -39,6 +39,14 @@ overflow.accumulation(
 
 The output raster values represent the total upstream cell count including self. The minimum value is 1 and values monotonically increase following flow paths downstream. Nodata cells have value -1 and are propagated down from the input.
 
+### Optional upstream inflow points
+
+`accumulation()` also accepts an optional point vector layer via `upstream_sources_path` and `upstream_sources_field`. Each point is treated as an inflow contribution placed in the raster cell that contains its coordinates.
+
+If a source point falls outside the flow-direction raster extent, the point is ignored and a warning is emitted instead of being applied. The value is then added to that cell and propagated downstream along the D8 network, which is useful for clipped or partial-watershed runs where an upstream contribution enters the model domain.
+
+Inflow values are carried across tile boundaries in tiled runs. A contribution applied in one tile is passed to downstream tiles, so each downstream cell receives the input value plus the inflow once, with no double counting at tile edges.
+
 !!! note
     The flow direction raster MUST have all non-nodata cells contain valid defined flow directions (0-7) and must not contain cycles. These requirements are met automatically when using `flow_direction()` with `resolve_flats=True` on properly conditioned DEM.
 

@@ -175,6 +175,30 @@ def test_fill_tile_with_nodata_no_edge(
     assert max_label == 3
 
 
+def test_fill_tile_respects_max_fill_depth():
+    """A depression should only be filled up to the requested maximum depth."""
+    dem = np.array(
+        [
+            [5, 5, 5, 5, 5],
+            [5, 4, 4, 4, 5],
+            [5, 4, 1, 4, 5],
+            [5, 4, 4, 4, 5],
+            [5, 5, 5, 5, 5],
+        ],
+        dtype=np.float32,
+    )
+    expected = dem.copy()
+    expected[2, 2] = 3.0
+
+    labels, _, _ = priority_flood_tile(dem, make_sides(), max_fill_depth=2.0)
+    assert np.allclose(dem[2, 2], expected[2, 2])
+    assert labels[2, 2] != 0
+    assert dem[1, 2] == 4.0
+    assert dem[2, 1] == 4.0
+    assert dem[2, 3] == 4.0
+    assert dem[3, 2] == 4.0
+
+
 def test_handle_edge():
     """Test handle_edge function produces expected graph"""
     dem_a = np.array([1, 2, 3, 4, 5])
